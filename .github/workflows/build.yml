@@ -1,20 +1,227 @@
-# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Build and Release
 
-name: Build
-
-on: 
+on:
   workflow_dispatch:
-  push:
-    branches:
-    - master
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+  pull-requests: read
 
 jobs:
-  pull_request:
+  build:
     runs-on: ubuntu-latest
+    env:
+      DALAMUD_HOME: /tmp/dalamud
+      DOTNET_NOLOGO: true
+
     steps:
-    - uses: daemitus/DalamudPluginPR2@master
-      with: 
-        token: ${{ secrets.PAT }}
-        plugin_name: FauxHollowsSolver
-        project_path: FauxHollowsSolver
-        plugin_owners: daemitus
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Download Dalamud
+      run: |
+        wget https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -O latest.zip
+        unzip -o latest.zip -d /tmp/dalamud
+
+    - name: Build
+      run: dotnet build -c Release
+
+    - name: Prepare Build Artifact
+      run: |
+        # Check if the plugin build system created a zip
+        if [ -f "FauxHollowsSolver/bin/Release/FauxHollowsSolver/latest.zip" ]; then
+          cp "FauxHollowsSolver/bin/Release/FauxHollowsSolver/latest.zip" "FauxHollowsSolver.zip"
+          mkdir -p Artifact
+          unzip -o FauxHollowsSolver.zip -d Artifact
+        else
+          # Create the package manually
+          releaseDir="FauxHollowsSolver/bin/Release"
+          packageDir="Artifact"
+
+          mkdir -p "$packageDir"
+
+          # Copy required files
+          cp "$releaseDir/FauxHollowsSolver.dll" "$packageDir/" 2>/dev/null || true
+          cp "$releaseDir/FauxHollowsSolver.json" "$packageDir/" 2>/dev/null || true
+          cp -r "$releaseDir/img" "$packageDir/" 2>/dev/null || true
+
+          # Create zip
+          cd "$packageDir"
+          zip -r "../FauxHollowsSolver.zip" .
+          cd ..
+        fi
+
+    - name: Upload FauxHollowsSolver
+      uses: actions/upload-artifact@v7
+      with:
+        name: FauxHollowsSolver
+        path: Artifact/*
+
+    - name: Update repo.json if needed
+      run: |
+        # Install jq for JSON processing
+        sudo apt-get update && sudo apt-get install -y jq
+
+        # Get versions
+        repo_version=$(jq -r '.[0].AssemblyVersion' repo.json)
+        build_version=$(jq -r '.AssemblyVersion' FauxHollowsSolver/bin/Release/FauxHollowsSolver.json)
+        dalamud_api_level=$(jq -r '.DalamudApiLevel // empty' FauxHollowsSolver/bin/Release/FauxHollowsSolver.json)
+        target_framework=$(sed -nE 's/.*<TargetFramework>([^<]+)<\/TargetFramework>.*/\1/p' FauxHollowsSolver/FauxHollowsSolver.csproj | head -n 1)
+        dotnet_runtime=$(echo "$target_framework" | sed -nE 's/^net([0-9]+(\.[0-9]+)?).*/.NET \1 Runtime/p')
+
+        echo "Repository version: $repo_version"
+        echo "Build version: $build_version"
+        echo "Target framework: ${target_framework:-unknown}"
+        echo "Dalamud API level: ${dalamud_api_level:-unknown}"
+
+        if [ "$repo_version" = "$build_version" ]; then
+          echo "No version change detected. Current version: $repo_version"
+          exit 0
+        fi
+
+        echo "Version change detected: $repo_version -> $build_version"
+        echo "BUILD_VERSION=$build_version" >> $GITHUB_ENV
+
+        # Generate changelog from commits since last release
+        echo "Generating changelog from commit history..."
+
+        # Get the latest release tag
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+        if [ -z "$latest_tag" ]; then
+          echo "No previous release found, using recent commits"
+          # Get recent commits when no previous release exists
+          changelog=$(git log --oneline --no-merges --grep="\[CI\]" --invert-grep --pretty=format:"- %s" -10)
+        else
+          echo "Latest release tag: $latest_tag"
+          commit_range="$latest_tag..HEAD"
+          # Get commits since last release, excluding CI commits
+          changelog=$(git log $commit_range --oneline --no-merges --grep="\[CI\]" --invert-grep --pretty=format:"- %s" | head -20)
+        fi
+
+        if [ -z "$changelog" ]; then
+          changelog="- Bug fixes and improvements"
+          echo "No commits found, using default changelog"
+        else
+          echo "Generated changelog:"
+          echo "$changelog"
+        fi
+
+        # Store changelog in environment variable
+        echo "GENERATED_CHANGELOG<<EOF" >> $GITHUB_ENV
+        echo "$changelog" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+
+        # Generate release requirements from build metadata so the release body
+        # stays in sync with the project file and Dalamud manifest.
+        {
+          echo "SYSTEM_REQUIREMENTS<<EOF"
+          echo "- Final Fantasy XIV with Dalamud"
+          if [ -n "$dotnet_runtime" ]; then
+            echo "- $dotnet_runtime"
+          elif [ -n "$target_framework" ]; then
+            echo "- $target_framework"
+          fi
+          if [ -n "$dalamud_api_level" ]; then
+            echo "- Dalamud API Level $dalamud_api_level"
+          fi
+          echo "EOF"
+        } >> $GITHUB_ENV
+
+        # Get current download count
+        total_downloads=0
+        if response=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                          -H "Accept: application/vnd.github.v3+json" \
+                          "https://api.github.com/repos/${{ github.repository }}/releases"); then
+          total_downloads=$(echo "$response" | jq -r '[.[]?.assets[]?.download_count // 0] | add // 0' 2>/dev/null || echo 0)
+          total_downloads=${total_downloads:-0}
+          echo "Current total download count: $total_downloads"
+        else
+          echo "Failed to get download count, using 0"
+          total_downloads=0
+        fi
+
+        # Get current timestamp in milliseconds
+        timestamp=$(date +%s)000
+
+        # Convert newlines to \r\n for proper display compatibility
+        changelog_escaped=$(echo "$changelog" | sed ':a;N;$!ba;s/\n/\r\n/g')
+
+        # Update repo.json using jq with escaped changelog
+        jq --arg version "$build_version" \
+           --arg timestamp "$timestamp" \
+           --arg downloads "$total_downloads" \
+           --arg changelog "$changelog_escaped" \
+           --arg dalamud_api_level "$dalamud_api_level" \
+           --arg install_url "https://github.com/${{ github.repository }}/releases/download/v$build_version/FauxHollowsSolver.zip" \
+           '.[0].AssemblyVersion = $version |
+            .[0].LastUpdate = ($timestamp | tonumber) |
+            .[0].DownloadCount = ($downloads | tonumber) |
+            .[0].Changelog = $changelog |
+            if $dalamud_api_level != "" then .[0].DalamudApiLevel = $dalamud_api_level else . end |
+            .[0].DownloadLinkInstall = $install_url |
+            .[0].DownloadLinkUpdate = $install_url' \
+           repo.json > repo.json.tmp && mv repo.json.tmp repo.json
+
+        echo "Updated repo.json:"
+        echo "- AssemblyVersion: $build_version"
+        echo "- LastUpdate: $timestamp"
+        echo "- DownloadCount: $total_downloads"
+        echo "- Changelog updated successfully"
+
+    - name: Create Release
+      if: ${{ env.BUILD_VERSION != '' }}
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        files: FauxHollowsSolver.zip
+        name: FauxHollowsSolver ${{ env.BUILD_VERSION }}
+        tag_name: v${{ env.BUILD_VERSION }}
+        prerelease: false
+        append_body: true
+        body: |
+          ## FauxHollowsSolver Plugin v${{ env.BUILD_VERSION }}
+
+          ### Changes
+          ${{ env.GENERATED_CHANGELOG }}
+
+          ### Installation
+          1. Add the repository URL to your Dalamud plugin repositories:
+             ```
+             https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/master/repo.json
+             ```
+          2. Install "FauxHollowsSolver" from the plugin installer
+
+          ### Manual Installation
+          Download `FauxHollowsSolver.zip` and extract to your Dalamud plugins directory.
+
+          ### System Requirements
+          ${{ env.SYSTEM_REQUIREMENTS }}
+        generate_release_notes: true
+        fail_on_unmatched_files: true
+
+    - name: Commit repo.json
+      if: ${{ env.BUILD_VERSION != '' }}
+      run: |
+        git config --global user.name "Actions User"
+        git config --global user.email "actions@github.com"
+
+        # Configure git to use the token for authentication
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+        git fetch origin master
+        git checkout master
+        git add repo.json
+        git commit -m "[CI] updating repo.json for ${{ env.BUILD_VERSION }}" || true
+        git push origin master
