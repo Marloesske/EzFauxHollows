@@ -48,7 +48,7 @@ jobs:
         fi
         echo "✅ repo.json is valid JSON"
 
-        # Check required fields
+        # Check required fieldss
         required_fields=("Author" "Name" "InternalName" "AssemblyVersion" "RepoUrl" "DownloadLinkInstall" "DownloadLinkUpdate")
 
         for field in "${required_fields[@]}"; do
