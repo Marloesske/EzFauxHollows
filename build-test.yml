@@ -1,0 +1,131 @@
+name: Build Test
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DALAMUD_HOME: /tmp/dalamud
+      DOTNET_NOLOGO: true
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Download Dalamud
+      run: |
+        wget https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -O latest.zip
+        unzip -o latest.zip -d /tmp/dalamud
+
+    - name: Build
+      run: dotnet build -c Release
+
+    - name: Validate repo.json format
+      run: |
+        # Install jq for JSON processing
+        sudo apt-get update && sudo apt-get install -y jq
+
+        # Validate JSON format
+        if ! jq empty repo.json 2>/dev/null; then
+          echo "❌ repo.json is not valid JSON"
+          exit 1
+        fi
+        echo "✅ repo.json is valid JSON"
+
+        # Check required fields
+        required_fields=("Author" "Name" "InternalName" "AssemblyVersion" "RepoUrl" "DownloadLinkInstall" "DownloadLinkUpdate")
+
+        for field in "${required_fields[@]}"; do
+          value=$(jq -r ".[0].$field // empty" repo.json)
+          if [ -z "$value" ] || [ "$value" = "null" ]; then
+            echo "❌ Missing required field: $field"
+            exit 1
+          fi
+          echo "✅ Found field: $field"
+        done
+
+        current_version=$(jq -r '.[0].AssemblyVersion' repo.json)
+        echo "Current version: $current_version"
+
+    - name: Check version consistency
+      run: |
+        # Get versions using jq
+        build_version=$(jq -r '.AssemblyVersion' FauxHollowsSolver/bin/Release/FauxHollowsSolver.json)
+        repo_version=$(jq -r '.[0].AssemblyVersion' repo.json)
+
+        echo "Build output version: $build_version"
+        echo "repo.json version: $repo_version"
+
+        if [ "$build_version" != "$repo_version" ]; then
+          echo "🔄 Version difference detected: $repo_version -> $build_version"
+          echo "This will trigger a release when pushed to master"
+        else
+          echo "✅ Versions are consistent"
+        fi
+
+    - name: Test package creation
+      run: |
+        release_dir="FauxHollowsSolver/bin/Release"
+        package_dir="test-package"
+
+        # Create test package directory
+        mkdir -p "$package_dir"
+
+        # Check required files exist
+        required_files=(
+          "$release_dir/FauxHollowsSolver.dll"
+          "$release_dir/FauxHollowsSolver.json"
+        )
+
+        for file in "${required_files[@]}"; do
+          if [ -f "$file" ]; then
+            echo "✅ Found: $file"
+            cp "$file" "$package_dir/"
+          else
+            echo "❌ Missing required file: $file"
+            exit 1
+          fi
+        done
+
+        # Check optional directories
+        optional_dirs=(
+          "$release_dir/img"
+        )
+
+        for dir in "${optional_dirs[@]}"; do
+          if [ -d "$dir" ]; then
+            echo "✅ Found: $dir"
+            cp -r "$dir" "$package_dir/"
+          else
+            echo "⚠️ Optional directory not found: $dir"
+          fi
+        done
+
+        # Create test zip
+        cd "$package_dir"
+        zip -r "../test-package.zip" .
+        cd ..
+        echo "✅ Test package created successfully"
+
+    - name: Upload test package
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-package
+        path: test-package.zip
+        retention-days: 7

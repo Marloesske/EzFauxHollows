@@ -1,0 +1,17 @@
+{
+    "Author": "Glorou",
+    "Name": "FauxHollowsSolver",
+    "Punchline": "A Dalamud plugin that highlights the best choices on your Faux Hollows attempt.",
+    "Description": "A Dalamud plugin that highlights the best choices on your Faux Hollows attempt.",
+    "IconUrl": "https://raw.githubusercontent.com/Glorou/EzFauxHollows/refs/heads/master/res/icon.png",
+    "repo_url": "https://github.com/Glorou/EzFauxHollows",
+    "image_urls": [
+        "https://raw.githubusercontent.com/Glorou/EzFauxHollows/refs/heads/master/res/demo.png"
+    ],
+    "category_tags": "Utility",
+    "ApplicableVersion": "any",
+    "Tags": [
+        "faux hollows",
+        "plugin"
+    ]
+}
